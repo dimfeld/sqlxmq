@@ -2,6 +2,9 @@
 [![Documentation](https://docs.rs/sqlxmq/badge.svg)](https://docs.rs/sqlxmq)
 [![crates.io](https://img.shields.io/crates/v/sqlxmq.svg)](https://crates.io/crates/sqlxmq)
 
+This fork of `sqlxmq` converts it to use Diesel instead of `sqlx`, so that is it easier
+to perform queue operations in the same transaction as other work.
+
 <!-- cargo-sync-readme start -->
 
 # sqlxmq

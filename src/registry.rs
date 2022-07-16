@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use anymap2::any::CloneAnySendSync;
 use anymap2::Map;
-use sqlx::{Pool, Postgres};
+use deadpool_diesel::postgres::Pool;
 use uuid::Uuid;
 
 use crate::hidden::{BuildFn, RunFn};
@@ -111,8 +111,8 @@ impl JobRegistry {
 
     /// Construct a job runner from this registry and the provided connection
     /// pool.
-    pub fn runner(self, pool: &Pool<Postgres>) -> JobRunnerOptions {
-        JobRunnerOptions::new(pool, move |current_job| {
+    pub fn runner(self, pool: Pool, connection_string: String) -> JobRunnerOptions {
+        JobRunnerOptions::new(pool, connection_string, move |current_job| {
             if let Some(job) = self.resolve_job(current_job.name()) {
                 (job.run_fn.0 .0)(&self, current_job);
             } else {

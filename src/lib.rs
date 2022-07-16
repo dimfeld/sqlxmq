@@ -119,7 +119,15 @@
 //! The first step is to define a function to be run on the job queue.
 //!
 //! ```rust
-//! use std::error::Error;
+//! use thiserror::Error;
+//!
+//! #[derive(Debug, Error)]
+//! pub enum Error {
+//!     #[error("Queue error: {0}")]
+//!     QueueError(#[from] sqlxmq::Error),
+//!     #[error("Invalid job payload: {0}")]
+//!     PayloadError(#[from] serde_json::Error),
+//! }
 //!
 //! use sqlxmq::{job, CurrentJob};
 //!
@@ -131,7 +139,7 @@
 //!     // Additional arguments are optional, but can be used to access context
 //!     // provided via [`JobRegistry::set_context`].
 //!     message: &'static str,
-//! ) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
+//! ) -> Result<(), Error> {
 //!     // Decode a JSON payload
 //!     let who: Option<String> = current_job.json()?;
 //!
@@ -139,7 +147,9 @@
 //!     println!("{}, {}!", message, who.as_deref().unwrap_or("world"));
 //!
 //!     // Mark the job as complete
-//!     current_job.complete().await?;
+//!     let conn = current_job.pool().get().await.map_err(sqlxmq::Error::from)?;
+//!     conn.interact(move |conn| current_job.complete(conn)).await
+//!         .map_err(sqlxmq::Error::from)??;
 //!
 //!     Ok(())
 //! }
@@ -151,25 +161,30 @@
 //! and executes them.
 //!
 //! ```rust,no_run
-//! use std::error::Error;
-//!
 //! use sqlxmq::JobRegistry;
+//! use thiserror::Error;
+//!
+//! #[derive(Debug, Error)]
+//! pub enum Error {
+//!     #[error("Queue error: {0}")]
+//!     QueueError(#[from] sqlxmq::Error),
+//! }
 //!
 //! # use sqlxmq::{job, CurrentJob};
 //! #
 //! # #[job]
 //! # async fn example_job(
 //! #     current_job: CurrentJob,
-//! # ) -> Result<(), Box<dyn Error + Send + Sync + 'static>> { Ok(()) }
+//! # ) -> Result<(), Error> { Ok(()) }
 //! #
-//! # async fn connect_to_db() -> sqlx::Result<sqlx::Pool<sqlx::Postgres>> {
+//! # fn connect_to_db() -> deadpool_diesel::postgres::Pool {
 //! #     unimplemented!()
 //! # }
 //!
 //! #[tokio::main]
-//! async fn main() -> Result<(), Box<dyn Error>> {
+//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     // You'll need to provide a Postgres connection pool.
-//!     let pool = connect_to_db().await?;
+//!     let pool = connect_to_db();
 //!
 //!     // Construct a job registry from our single job.
 //!     let mut registry = JobRegistry::new(&[example_job]);
@@ -181,7 +196,7 @@
 //!
 //!     let runner = registry
 //!         // Create a job runner using the connection pool.
-//!         .runner(&pool)
+//!         .runner(pool, "connection_string".to_string())
 //!         // Here is where you can configure the job runner
 //!         // Aim to keep 10-20 jobs running at a time.
 //!         .set_concurrency(10, 20)
@@ -209,14 +224,13 @@
 //! # ) -> Result<(), Box<dyn Error + Send + Sync + 'static>> { Ok(()) }
 //! #
 //! # async fn example(
-//! #     pool: sqlx::Pool<sqlx::Postgres>
+//! #     conn: &mut diesel::PgConnection
 //! # ) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
 //! example_job.builder()
 //!     // This is where we can override job configuration
 //!     .set_channel_name("bar")
 //!     .set_json("John")?
-//!     .spawn(&pool)
-//!     .await?;
+//!     .spawn(conn)?;
 //! #     Ok(())
 //! # }
 //! ```
@@ -228,6 +242,7 @@ mod runner;
 mod spawn;
 mod utils;
 
+use diesel::result::DatabaseErrorKind;
 pub use registry::*;
 pub use runner::*;
 pub use spawn::*;
@@ -238,19 +253,22 @@ pub use utils::OwnedHandle;
 ///
 /// For best results, database operations should be automatically retried if one
 /// of these errors is returned.
-pub fn should_retry(error: &sqlx::Error) -> bool {
-    if let Some(db_error) = error.as_database_error() {
+pub fn should_retry(error: &diesel::result::Error) -> bool {
+    if let diesel::result::Error::DatabaseError(kind, err) = error {
         // It's more readable as a match
         #[allow(clippy::match_like_matches_macro)]
-        match (db_error.code().as_deref(), db_error.constraint()) {
+        match (kind, err.constraint_name()) {
             // Foreign key constraint violation on ordered channel
-            (Some("23503"), Some("mq_msgs_after_message_id_fkey")) => true,
+            (DatabaseErrorKind::ForeignKeyViolation, Some("mq_msgs_after_message_id_fkey")) => true,
             // Unique constraint violation on ordered channel
-            (Some("23505"), Some("mq_msgs_channel_name_channel_args_after_message_id_idx")) => true,
+            (
+                DatabaseErrorKind::UniqueViolation,
+                Some("mq_msgs_channel_name_channel_args_after_message_id_idx"),
+            ) => true,
             // Serialization failure
-            (Some("40001"), _) => true,
+            (DatabaseErrorKind::SerializationFailure, _) => true,
             // Deadlock detected
-            (Some("40P01"), _) => true,
+            (DatabaseErrorKind::Unknown, _) => err.message().contains("deadlock"),
             // Other
             _ => false,
         }
@@ -272,9 +290,10 @@ mod tests {
     use std::sync::{Arc, Once};
     use std::time::Duration;
 
+    use deadpool_diesel::postgres::Pool;
+    use diesel::prelude::*;
     use futures::channel::mpsc;
     use futures::StreamExt;
-    use sqlx::{Pool, Postgres};
     use tokio::sync::{Mutex, MutexGuard};
     use tokio::task;
 
@@ -288,7 +307,7 @@ mod tests {
         }
     }
 
-    async fn test_pool() -> TestGuard<Pool<Postgres>> {
+    async fn test_pool() -> TestGuard<(Pool, deadpool_diesel::postgres::Object, String)> {
         static INIT_LOGGER: Once = Once::new();
         static TEST_MUTEX: Mutex<()> = Mutex::const_new(());
 
@@ -298,24 +317,31 @@ mod tests {
 
         INIT_LOGGER.call_once(pretty_env_logger::init);
 
-        let pool = Pool::connect(&env::var("DATABASE_URL").unwrap())
-            .await
-            .unwrap();
+        let connection_str = env::var("DATABASE_URL").unwrap();
+        let manager = deadpool_diesel::postgres::Manager::new(
+            &connection_str,
+            deadpool_diesel::Runtime::Tokio1,
+        );
+        let pool = Pool::builder(manager).build().unwrap();
 
-        sqlx::query("TRUNCATE TABLE mq_payloads")
-            .execute(&pool)
-            .await
-            .unwrap();
-        sqlx::query("DELETE FROM mq_msgs WHERE id != uuid_nil()")
-            .execute(&pool)
-            .await
-            .unwrap();
+        let conn = pool.get().await.unwrap();
 
-        TestGuard(guard, pool)
+        conn.interact(|conn| {
+            diesel::sql_query("TRUNCATE TABLE mq_payloads")
+                .execute(conn)
+                .unwrap();
+            diesel::sql_query("DELETE FROM mq_msgs WHERE id != uuid_nil()")
+                .execute(conn)
+                .unwrap();
+        })
+        .await
+        .unwrap();
+
+        TestGuard(guard, (pool, conn, connection_str))
     }
 
     async fn test_job_runner<F: Future + Send + 'static>(
-        pool: &Pool<Postgres>,
+        pool: &Pool,
         f: impl (Fn(CurrentJob) -> F) + Send + Sync + 'static,
     ) -> (OwnedHandle, Arc<AtomicUsize>)
     where
@@ -323,10 +349,14 @@ mod tests {
     {
         let counter = Arc::new(AtomicUsize::new(0));
         let counter2 = counter.clone();
-        let runner = JobRunnerOptions::new(pool, move |job| {
-            counter2.fetch_add(1, Ordering::SeqCst);
-            task::spawn(f(job));
-        })
+        let runner = JobRunnerOptions::new(
+            pool.clone(),
+            env::var("DATABASE_URL").unwrap(),
+            move |job| {
+                counter2.fetch_add(1, Ordering::SeqCst);
+                task::spawn(f(job));
+            },
+        )
         .run()
         .await
         .unwrap();
@@ -339,36 +369,40 @@ mod tests {
 
     #[job(channel_name = "foo", ordered, retries = 3, backoff_secs = 2.0)]
     async fn example_job1(
-        mut current_job: CurrentJob,
+        current_job: CurrentJob,
     ) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
-        current_job.complete().await?;
+        complete_job(current_job).await;
         Ok(())
     }
 
     #[job(proto(job_proto))]
     async fn example_job2(
-        mut current_job: CurrentJob,
+        current_job: CurrentJob,
     ) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
-        current_job.complete().await?;
+        complete_job(current_job).await;
         Ok(())
     }
 
     #[job]
     async fn example_job_with_ctx(
-        mut current_job: CurrentJob,
+        current_job: CurrentJob,
         ctx1: i32,
         ctx2: &'static str,
     ) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
         assert_eq!(ctx1, 42);
         assert_eq!(ctx2, "Hello, world!");
-        current_job.complete().await?;
+        complete_job(current_job).await;
         Ok(())
     }
 
-    async fn named_job_runner(pool: &Pool<Postgres>) -> OwnedHandle {
+    async fn named_job_runner(pool: Pool, connection_string: String) -> OwnedHandle {
         let mut registry = JobRegistry::new(&[example_job1, example_job2, example_job_with_ctx]);
         registry.set_context(42).set_context("Hello, world!");
-        registry.runner(pool).run().await.unwrap()
+        registry
+            .runner(pool, connection_string)
+            .run()
+            .await
+            .unwrap()
     }
 
     fn is_ci() -> bool {
@@ -391,15 +425,26 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(ms)).await;
     }
 
+    async fn complete_job(mut job: CurrentJob) {
+        let conn = job.pool().get().await.unwrap();
+        conn.interact(move |conn| job.complete(conn))
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn it_can_spawn_job() {
         {
-            let pool = &*test_pool().await;
+            let (pool, conn, _) = &*test_pool().await;
             let (_runner, counter) =
-                test_job_runner(pool, |mut job| async move { job.complete().await }).await;
+                test_job_runner(pool, |job| async move { complete_job(job).await }).await;
 
             assert_eq!(counter.load(Ordering::SeqCst), 0);
-            JobBuilder::new("foo").spawn(pool).await.unwrap();
+            conn.interact(|conn| JobBuilder::new("foo").spawn(conn))
+                .await
+                .unwrap()
+                .unwrap();
             pause().await;
             assert_eq!(counter.load(Ordering::SeqCst), 1);
         }
@@ -409,42 +454,47 @@ mod tests {
     #[tokio::test]
     async fn it_can_clear_jobs() {
         {
-            let pool = &*test_pool().await;
-            JobBuilder::new("foo")
-                .set_channel_name("foo")
-                .spawn(pool)
-                .await
-                .unwrap();
-            JobBuilder::new("foo")
-                .set_channel_name("foo")
-                .spawn(pool)
-                .await
-                .unwrap();
-            JobBuilder::new("foo")
-                .set_channel_name("bar")
-                .spawn(pool)
-                .await
-                .unwrap();
-            JobBuilder::new("foo")
-                .set_channel_name("bar")
-                .spawn(pool)
-                .await
-                .unwrap();
-            JobBuilder::new("foo")
-                .set_channel_name("baz")
-                .spawn(pool)
-                .await
-                .unwrap();
-            JobBuilder::new("foo")
-                .set_channel_name("baz")
-                .spawn(pool)
-                .await
-                .unwrap();
+            let (pool, conn, _) = &*test_pool().await;
 
-            sqlxmq::clear(pool, &["foo", "baz"]).await.unwrap();
+            conn.interact(|conn| {
+                JobBuilder::new("foo")
+                    .set_channel_name("foo")
+                    .spawn(conn)
+                    .unwrap();
+                JobBuilder::new("foo")
+                    .set_channel_name("foo")
+                    .spawn(conn)
+                    .unwrap();
+                JobBuilder::new("foo")
+                    .set_channel_name("bar")
+                    .spawn(conn)
+                    .unwrap();
+                JobBuilder::new("foo")
+                    .set_channel_name("bar")
+                    .spawn(conn)
+                    .unwrap();
+                JobBuilder::new("foo")
+                    .set_channel_name("baz")
+                    .spawn(conn)
+                    .unwrap();
+                JobBuilder::new("foo")
+                    .set_channel_name("baz")
+                    .spawn(conn)
+                    .unwrap();
 
-            let (_runner, counter) =
-                test_job_runner(pool, |mut job| async move { job.complete().await }).await;
+                sqlxmq::clear(conn, &["foo", "baz"]).unwrap();
+            })
+            .await
+            .unwrap();
+
+            let (_runner, counter) = test_job_runner(pool, |mut job| async move {
+                let conn = job.pool().get().await.unwrap();
+                conn.interact(move |conn| job.complete(conn))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            })
+            .await;
 
             pause().await;
             assert_eq!(counter.load(Ordering::SeqCst), 2);
@@ -455,7 +505,7 @@ mod tests {
     #[tokio::test]
     async fn it_runs_jobs_in_order() {
         {
-            let pool = &*test_pool().await;
+            let (pool, conn, _) = &*test_pool().await;
             let (tx, mut rx) = mpsc::unbounded();
 
             let (_runner, counter) = test_job_runner(pool, move |job| {
@@ -467,22 +517,26 @@ mod tests {
             .await;
 
             assert_eq!(counter.load(Ordering::SeqCst), 0);
-            JobBuilder::new("foo")
-                .set_ordered(true)
-                .spawn(pool)
-                .await
-                .unwrap();
-            JobBuilder::new("bar")
-                .set_ordered(true)
-                .spawn(pool)
-                .await
-                .unwrap();
+            conn.interact(|conn| {
+                JobBuilder::new("foo")
+                    .set_ordered(true)
+                    .spawn(conn)
+                    .unwrap();
+                JobBuilder::new("bar")
+                    .set_ordered(true)
+                    .spawn(conn)
+                    .unwrap();
+            })
+            .await
+            .unwrap();
 
             pause().await;
             assert_eq!(counter.load(Ordering::SeqCst), 1);
 
             let mut job = rx.next().await.unwrap();
-            job.complete().await.unwrap();
+            conn.interact(move |conn| job.complete(conn).unwrap())
+                .await
+                .unwrap();
 
             pause().await;
             assert_eq!(counter.load(Ordering::SeqCst), 2);
@@ -493,7 +547,7 @@ mod tests {
     #[tokio::test]
     async fn it_runs_jobs_in_parallel() {
         {
-            let pool = &*test_pool().await;
+            let (pool, conn, _) = &*test_pool().await;
             let (tx, mut rx) = mpsc::unbounded();
 
             let (_runner, counter) = test_job_runner(pool, move |job| {
@@ -505,15 +559,19 @@ mod tests {
             .await;
 
             assert_eq!(counter.load(Ordering::SeqCst), 0);
-            JobBuilder::new("foo").spawn(pool).await.unwrap();
-            JobBuilder::new("bar").spawn(pool).await.unwrap();
+            conn.interact(|conn| {
+                JobBuilder::new("foo").spawn(conn).unwrap();
+                JobBuilder::new("bar").spawn(conn).unwrap();
+            })
+            .await
+            .unwrap();
 
             pause().await;
             assert_eq!(counter.load(Ordering::SeqCst), 2);
 
             for _ in 0..2 {
-                let mut job = rx.next().await.unwrap();
-                job.complete().await.unwrap();
+                let job = rx.next().await.unwrap();
+                complete_job(job).await;
             }
         }
         pause().await;
@@ -522,18 +580,21 @@ mod tests {
     #[tokio::test]
     async fn it_retries_failed_jobs() {
         {
-            let pool = &*test_pool().await;
+            let (pool, conn, _) = &*test_pool().await;
             let (_runner, counter) = test_job_runner(pool, move |_| async {}).await;
 
             let backoff = default_pause() + 300;
 
             assert_eq!(counter.load(Ordering::SeqCst), 0);
-            JobBuilder::new("foo")
-                .set_retry_backoff(Duration::from_millis(backoff))
-                .set_retries(2)
-                .spawn(pool)
-                .await
-                .unwrap();
+            conn.interact(move |conn| {
+                JobBuilder::new("foo")
+                    .set_retry_backoff(Duration::from_millis(backoff))
+                    .set_retries(2)
+                    .spawn(conn)
+                    .unwrap();
+            })
+            .await
+            .unwrap();
 
             // First attempt
             pause().await;
@@ -559,31 +620,38 @@ mod tests {
     #[tokio::test]
     async fn it_can_checkpoint_jobs() {
         {
-            let pool = &*test_pool().await;
+            let (pool, conn, _) = &*test_pool().await;
             let (_runner, counter) = test_job_runner(pool, move |mut current_job| async move {
                 let state: bool = current_job.json().unwrap().unwrap();
-                if state {
-                    current_job.complete().await.unwrap();
-                } else {
-                    current_job
-                        .checkpoint(Checkpoint::new().set_json(&true).unwrap())
-                        .await
-                        .unwrap();
-                }
+                let conn = current_job.pool().get().await.unwrap();
+                conn.interact(move |conn| {
+                    if state {
+                        current_job.complete(conn).unwrap();
+                    } else {
+                        current_job
+                            .checkpoint(conn, Checkpoint::new().set_json(&true).unwrap())
+                            .unwrap();
+                    }
+                })
+                .await
+                .unwrap();
             })
             .await;
 
             let backoff = default_pause();
 
             assert_eq!(counter.load(Ordering::SeqCst), 0);
-            JobBuilder::new("foo")
-                .set_retry_backoff(Duration::from_millis(backoff))
-                .set_retries(5)
-                .set_json(&false)
-                .unwrap()
-                .spawn(pool)
-                .await
-                .unwrap();
+            conn.interact(move |conn| {
+                JobBuilder::new("foo")
+                    .set_retry_backoff(Duration::from_millis(backoff))
+                    .set_retries(5)
+                    .set_json(&false)
+                    .unwrap()
+                    .spawn(conn)
+            })
+            .await
+            .unwrap()
+            .unwrap();
 
             // First attempt
             pause().await;
@@ -603,12 +671,16 @@ mod tests {
     #[tokio::test]
     async fn it_can_use_registry() {
         {
-            let pool = &*test_pool().await;
-            let _runner = named_job_runner(pool).await;
+            let (pool, conn, conn_str) = &*test_pool().await;
+            let _runner = named_job_runner(pool.clone(), conn_str.clone()).await;
 
-            example_job1.builder().spawn(pool).await.unwrap();
-            example_job2.builder().spawn(pool).await.unwrap();
-            example_job_with_ctx.builder().spawn(pool).await.unwrap();
+            conn.interact(|conn| {
+                example_job1.builder().spawn(conn).unwrap();
+                example_job2.builder().spawn(conn).unwrap();
+                example_job_with_ctx.builder().spawn(conn).unwrap();
+            })
+            .await
+            .unwrap();
             pause().await;
         }
         pause().await;

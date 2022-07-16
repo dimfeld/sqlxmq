@@ -2,8 +2,8 @@ use std::borrow::Cow;
 use std::fmt::Debug;
 use std::time::Duration;
 
+use diesel::{data_types::PgInterval, prelude::*, FromSqlRow, PgConnection, QueryableByName};
 use serde::Serialize;
-use sqlx::Postgres;
 use uuid::Uuid;
 
 /// Type for building a job to send.
@@ -111,75 +111,71 @@ impl<'a> JobBuilder<'a> {
         Ok(self)
     }
 
-    /// Spawn the job using the given executor. This might be a connection
-    /// pool, a connection, or a transaction.
-    pub async fn spawn<'b, E: sqlx::Executor<'b, Database = Postgres>>(
+    /// Spawn the job
+    pub fn spawn(
         &self,
-        executor: E,
-    ) -> Result<Uuid, sqlx::Error> {
-        sqlx::query(
+        conn: &mut diesel::pg::PgConnection,
+    ) -> Result<Uuid, diesel::result::Error> {
+        use diesel::{prelude::*, sql_types::*};
+
+        diesel::sql_query(
             "SELECT mq_insert(ARRAY[($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)::mq_new_t])",
         )
-        .bind(self.id)
-        .bind(self.delay)
-        .bind(self.retries as i32)
-        .bind(self.retry_backoff)
-        .bind(self.channel_name)
-        .bind(self.channel_args)
-        .bind(self.commit_interval)
-        .bind(self.ordered)
-        .bind(self.name)
-        .bind(self.payload_json.as_deref())
-        .bind(self.payload_bytes)
-        .execute(executor)
-        .await?;
+        .bind::<Uuid, _>(self.id)
+        .bind::<Interval, _>(PgInterval::from_microseconds(self.delay.as_micros() as i64))
+        .bind::<Integer, _>(self.retries as i32)
+        .bind::<Interval, _>(PgInterval::from_microseconds(
+            self.retry_backoff.as_micros() as i64,
+        ))
+        .bind::<Text, _>(self.channel_name)
+        .bind::<Text, _>(self.channel_args)
+        .bind::<Nullable<Interval>, _>(
+            self.commit_interval
+                .map(|d| PgInterval::from_microseconds(d.as_micros() as i64)),
+        )
+        .bind::<Bool, _>(self.ordered)
+        .bind::<Text, _>(self.name)
+        .bind::<Nullable<Text>, _>(self.payload_json.as_deref())
+        .bind::<Nullable<Binary>, _>(self.payload_bytes)
+        .execute(conn)?;
+
         Ok(self.id)
     }
 }
 
 /// Commit the specified jobs. The jobs should have been previously spawned
 /// with the two-phase commit option enabled.
-pub async fn commit<'b, E: sqlx::Executor<'b, Database = Postgres>>(
-    executor: E,
-    job_ids: &[Uuid],
-) -> Result<(), sqlx::Error> {
-    sqlx::query("SELECT mq_commit($1)")
-        .bind(job_ids)
-        .execute(executor)
-        .await?;
+pub fn commit(conn: &mut PgConnection, job_ids: &[Uuid]) -> Result<(), diesel::result::Error> {
+    diesel::sql_query("SELECT mq_commit($1)")
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(job_ids)
+        .execute(conn)?;
     Ok(())
 }
 
 /// Clear jobs from the specified channels.
-pub async fn clear<'b, E: sqlx::Executor<'b, Database = Postgres>>(
-    executor: E,
-    channel_names: &[&str],
-) -> Result<(), sqlx::Error> {
-    sqlx::query("SELECT mq_clear($1)")
-        .bind(channel_names)
-        .execute(executor)
-        .await?;
+pub fn clear(conn: &mut PgConnection, channel_names: &[&str]) -> Result<(), diesel::result::Error> {
+    diesel::sql_query("SELECT mq_clear($1)")
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(channel_names)
+        .execute(conn)?;
     Ok(())
 }
 
 /// Clear jobs from all channels.
-pub async fn clear_all<'b, E: sqlx::Executor<'b, Database = Postgres>>(
-    executor: E,
-) -> Result<(), sqlx::Error> {
-    sqlx::query("SELECT mq_clear_all()")
-        .execute(executor)
-        .await?;
+pub fn clear_all(conn: &mut PgConnection) -> Result<(), diesel::result::Error> {
+    diesel::sql_query("SELECT mq_clear_all()").execute(conn)?;
     Ok(())
 }
 
+#[derive(QueryableByName, FromSqlRow)]
+struct Exists {
+    #[diesel(sql_type = diesel::sql_types::Bool)]
+    e: bool,
+}
+
 /// Check if a job with that ID exists
-pub async fn exists<'b, E: sqlx::Executor<'b, Database = Postgres>>(
-    executor: E,
-    id: Uuid,
-) -> Result<bool, sqlx::Error> {
-    let exists = sqlx::query_scalar("SELECT EXISTS(SELECT id FROM mq_msgs WHERE id = $1)")
-        .bind(id)
-        .fetch_one(executor)
-        .await?;
-    Ok(exists)
+pub fn exists(conn: &mut PgConnection, id: Uuid) -> Result<bool, diesel::result::Error> {
+    let exists = diesel::sql_query("SELECT EXISTS(SELECT id FROM mq_msgs WHERE id = $1) as e")
+        .bind::<diesel::sql_types::Uuid, _>(id)
+        .load::<Exists>(conn)?;
+    Ok(exists[0].e)
 }

@@ -4,25 +4,67 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use deadpool_diesel::postgres::Pool;
+use diesel::data_types::PgInterval;
+use diesel::prelude::*;
+use diesel::sql_types;
 use serde::{Deserialize, Serialize};
-use sqlx::postgres::types::PgInterval;
 use sqlx::postgres::PgListener;
-use sqlx::{Pool, Postgres};
+use thiserror::Error;
 use tokio::sync::{oneshot, Notify};
 use tokio::task;
 use uuid::Uuid;
 
 use crate::utils::{Opaque, OwnedHandle};
 
+#[derive(Debug, Error)]
+/// Errors that can be returned by the runner.
+pub enum Error {
+    /// An error while executing a database query
+    #[error("Database error {0}")]
+    Diesel(#[from] diesel::result::Error),
+    /// A panic while executing a database query
+    #[error("Query panicked: {0}")]
+    Interact(String),
+    /// An error while acquiring a connection
+    #[error("Database pool error: {0}")]
+    Pool(#[from] deadpool_diesel::PoolError),
+    /// An error from the pg_notify listener
+    #[error("Listener error: {0}")]
+    ListenerError(#[from] sqlx::Error),
+}
+
+impl From<deadpool_diesel::InteractError> for Error {
+    fn from(e: deadpool_diesel::InteractError) -> Self {
+        Self::Interact(e.to_string())
+    }
+}
+
 /// Type used to build a job runner.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct JobRunnerOptions {
     min_concurrency: usize,
     max_concurrency: usize,
     channel_names: Option<Vec<String>>,
     dispatch: Opaque<Arc<dyn Fn(CurrentJob) + Send + Sync + 'static>>,
-    pool: Pool<Postgres>,
+    pool: Pool,
+    runtime: tokio::runtime::Handle,
+    database_url: String,
     keep_alive: bool,
+}
+
+impl std::fmt::Debug for JobRunnerOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JobRunnerOptions")
+            .field("min_concurrency", &self.min_concurrency)
+            .field("max_concurrency", &self.max_concurrency)
+            .field("channel_names", &self.channel_names)
+            .field("dispatch", &self.dispatch)
+            .field("runtime", &self.runtime)
+            .field("database_url", &self.database_url)
+            .field("keep_alive", &self.keep_alive)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug)]
@@ -77,19 +119,14 @@ impl<'a> Checkpoint<'a> {
         self.payload_json = Some(Cow::Owned(value));
         Ok(self)
     }
-    async fn execute<'b, E: sqlx::Executor<'b, Database = Postgres>>(
-        &self,
-        job_id: Uuid,
-        executor: E,
-    ) -> Result<(), sqlx::Error> {
-        sqlx::query("SELECT mq_checkpoint($1, $2, $3, $4, $5)")
-            .bind(job_id)
-            .bind(self.duration)
-            .bind(self.payload_json.as_deref())
-            .bind(self.payload_bytes)
-            .bind(self.extra_retries as i32)
-            .execute(executor)
-            .await?;
+    fn execute<'b>(&'a self, job_id: Uuid, conn: &'b mut PgConnection) -> Result<(), Error> {
+        diesel::sql_query("SELECT mq_checkpoint($1, $2, $3, $4, $5)")
+            .bind::<sql_types::Uuid, _>(job_id)
+            .bind::<sql_types::Interval, _>(from_duration(self.duration))
+            .bind::<sql_types::Nullable<sql_types::Text>, _>(self.payload_json.as_deref())
+            .bind::<sql_types::Nullable<sql_types::Binary>, _>(self.payload_bytes)
+            .bind::<sql_types::Integer, _>(self.extra_retries as i32)
+            .execute(conn)?;
         Ok(())
     }
 }
@@ -110,67 +147,86 @@ pub struct CurrentJob {
 
 impl CurrentJob {
     /// Returns the database pool used to receive this job.
-    pub fn pool(&self) -> &Pool<Postgres> {
+    pub fn pool(&self) -> &Pool {
         &self.job_runner.options.pool
     }
-    async fn delete(
-        &self,
-        executor: impl sqlx::Executor<'_, Database = Postgres>,
-    ) -> Result<(), sqlx::Error> {
-        sqlx::query("SELECT mq_delete(ARRAY[$1])")
-            .bind(self.id)
-            .execute(executor)
-            .await?;
+
+    fn delete(&self, conn: &mut diesel::pg::PgConnection) -> Result<(), diesel::result::Error> {
+        diesel::sql_query("SELECT mq_delete(ARRAY[$1])")
+            .bind::<diesel::sql_types::Uuid, _>(self.id)
+            .execute(conn)?;
+
         Ok(())
     }
 
-    async fn stop_keep_alive(&mut self) {
+    fn stop_keep_alive(&mut self) {
         if let Some(keep_alive) = self.keep_alive.take() {
-            keep_alive.stop().await;
+            self.job_runner.options.runtime.block_on(keep_alive.stop());
         }
     }
 
-    /// Complete this job and commit the provided transaction at the same time.
-    /// If the transaction cannot be committed, the job will not be completed.
-    pub async fn complete_with_transaction(
+    /// Run the provided closure in a transaction and commit the job in the same
+    /// transaction. If the transaction cannot be committed, the job will not be
+    /// completed.
+    pub fn complete_with_transaction<F, RETVAL, ERR>(
         &mut self,
-        mut tx: sqlx::Transaction<'_, Postgres>,
-    ) -> Result<(), sqlx::Error> {
-        self.delete(&mut tx).await?;
-        tx.commit().await?;
-        self.stop_keep_alive().await;
-        Ok(())
+        conn: &mut PgConnection,
+        mut f: F,
+    ) -> Result<RETVAL, ERR>
+    where
+        F: (FnMut(&mut PgConnection) -> Result<RETVAL, ERR>) + Send + 'static,
+        ERR: From<diesel::result::Error> + Send + Sync + 'static,
+        RETVAL: Send + 'static,
+    {
+        let result = conn.transaction(|conn| {
+            self.delete(conn)?;
+            let result = (f)(conn)?;
+            Ok::<RETVAL, ERR>(result)
+        })?;
+        self.stop_keep_alive();
+        Ok(result)
     }
+
     /// Complete this job.
-    pub async fn complete(&mut self) -> Result<(), sqlx::Error> {
-        self.delete(self.pool()).await?;
-        self.stop_keep_alive().await;
+    pub fn complete(&mut self, conn: &mut PgConnection) -> Result<(), Error> {
+        self.delete(conn)?;
+        self.stop_keep_alive();
         Ok(())
     }
+
     /// Checkpoint this job and commit the provided transaction at the same time.
     /// If the transaction cannot be committed, the job will not be checkpointed.
     /// Checkpointing allows the job payload to be replaced for the next retry.
-    pub async fn checkpoint_with_transaction(
+    pub fn checkpoint_with_transaction<F, RETVAL, ERR>(
         &mut self,
-        mut tx: sqlx::Transaction<'_, Postgres>,
-        checkpoint: &Checkpoint<'_>,
-    ) -> Result<(), sqlx::Error> {
-        checkpoint.execute(self.id, &mut tx).await?;
-        tx.commit().await?;
-        Ok(())
+        conn: &mut PgConnection,
+        mut f: F,
+    ) -> Result<RETVAL, ERR>
+    where
+        for<'a> F: FnMut(&'a mut PgConnection) -> Result<(Checkpoint<'static>, RETVAL), ERR>,
+        ERR: From<Error> + From<diesel::result::Error>,
+    {
+        conn.transaction(|conn| {
+            let (checkpoint, retval) = (f)(conn)?;
+            checkpoint.execute(self.id, conn)?;
+            Ok::<RETVAL, ERR>(retval)
+        })
     }
     /// Checkpointing allows the job payload to be replaced for the next retry.
-    pub async fn checkpoint(&mut self, checkpoint: &Checkpoint<'_>) -> Result<(), sqlx::Error> {
-        checkpoint.execute(self.id, self.pool()).await?;
+    pub fn checkpoint(
+        &mut self,
+        conn: &mut PgConnection,
+        checkpoint: &Checkpoint<'_>,
+    ) -> Result<(), Error> {
+        checkpoint.execute(self.id, conn)?;
         Ok(())
     }
     /// Prevent this job from being retried for the specified interval.
-    pub async fn keep_alive(&mut self, duration: Duration) -> Result<(), sqlx::Error> {
-        sqlx::query("SELECT mq_keep_alive(ARRAY[$1], $2)")
-            .bind(self.id)
-            .bind(duration)
-            .execute(self.pool())
-            .await?;
+    pub fn keep_alive(&mut self, conn: &mut PgConnection, duration: Duration) -> Result<(), Error> {
+        diesel::sql_query("SELECT mq_keep_alive(ARRAY[$1], $2)")
+            .bind::<sql_types::Uuid, _>(self.id)
+            .bind::<sql_types::Interval, _>(from_duration(duration))
+            .execute(conn)?;
         Ok(())
     }
     /// Returns the ID of this job.
@@ -212,14 +268,20 @@ impl Drop for CurrentJob {
 impl JobRunnerOptions {
     /// Begin constructing a new job runner using the specified connection pool,
     /// and the provided execution function.
-    pub fn new<F: Fn(CurrentJob) + Send + Sync + 'static>(pool: &Pool<Postgres>, f: F) -> Self {
+    pub fn new<F: Fn(CurrentJob) + Send + Sync + 'static>(
+        pool: Pool,
+        database_url: String,
+        f: F,
+    ) -> Self {
         Self {
             min_concurrency: 16,
             max_concurrency: 32,
             channel_names: None,
             keep_alive: true,
             dispatch: Opaque(Arc::new(f)),
-            pool: pool.clone(),
+            runtime: tokio::runtime::Handle::current(),
+            pool,
+            database_url,
         }
     }
     /// Set the concurrency limits for this job runner. When the number of active
@@ -253,7 +315,7 @@ impl JobRunnerOptions {
 
     /// Start the job runner in the background. The job runner will stop when the
     /// returned handle is dropped.
-    pub async fn run(&self) -> Result<OwnedHandle, sqlx::Error> {
+    pub async fn run(&self) -> Result<OwnedHandle, Error> {
         let options = self.clone();
         let job_runner = Arc::new(JobRunner {
             options,
@@ -269,7 +331,7 @@ impl JobRunnerOptions {
 
     /// Run a single job and then return. Intended for use by tests. The job should
     /// have been spawned normally and be ready to run.
-    pub async fn test_one(&self) -> Result<(), sqlx::Error> {
+    pub async fn test_one(&self) -> Result<(), Error> {
         let options = self.clone();
         let job_runner = Arc::new(JobRunner {
             options,
@@ -278,10 +340,17 @@ impl JobRunnerOptions {
         });
 
         log::info!("Polling for single message");
-        let mut messages = sqlx::query_as::<_, PolledMessage>("SELECT * FROM mq_poll($1, 1)")
-            .bind(&self.channel_names)
-            .fetch_all(&self.pool)
-            .await?;
+        let conn = self.pool.get().await?;
+        let channel_names = self.channel_names.clone();
+        let mut messages = conn
+            .interact(move |conn| {
+                diesel::sql_query("SELECT * FROM mq_poll($1, 1)")
+                    .bind::<sql_types::Nullable<sql_types::Array<sql_types::Text>>, _>(
+                        channel_names,
+                    )
+                    .load::<PolledMessage>(conn)
+            })
+            .await??;
 
         assert_eq!(messages.len(), 1, "Expected one message to be ready");
         let msg = messages.pop().unwrap();
@@ -321,7 +390,8 @@ impl JobRunnerOptions {
 }
 
 async fn start_listener(job_runner: Arc<JobRunner>) -> Result<OwnedHandle, sqlx::Error> {
-    let mut listener = PgListener::connect_with(&job_runner.options.pool).await?;
+    let mut listener = PgListener::connect(&job_runner.options.database_url).await?;
+
     if let Some(channels) = &job_runner.options.channel_names {
         let names: Vec<String> = channels.iter().map(|c| format!("mq_{}", c)).collect();
         listener
@@ -344,14 +414,21 @@ async fn start_listener(job_runner: Arc<JobRunner>) -> Result<OwnedHandle, sqlx:
     })))
 }
 
-#[derive(sqlx::FromRow)]
+#[derive(QueryableByName)]
 struct PolledMessage {
+    #[diesel(sql_type = sql_types::Nullable<sql_types::Uuid>)]
     id: Option<Uuid>,
+    #[diesel(sql_type = sql_types::Nullable<sql_types::Bool>)]
     is_committed: Option<bool>,
+    #[diesel(sql_type = sql_types::Nullable<sql_types::Text>)]
     name: Option<String>,
+    #[diesel(sql_type = sql_types::Nullable<sql_types::Text>)]
     payload_json: Option<String>,
+    #[diesel(sql_type = sql_types::Nullable<sql_types::Binary>)]
     payload_bytes: Option<Vec<u8>>,
+    #[diesel(sql_type = sql_types::Nullable<sql_types::Interval>)]
     retry_backoff: Option<PgInterval>,
+    #[diesel(sql_type = sql_types::Nullable<sql_types::Interval>)]
     wait_time: Option<PgInterval>,
 }
 
@@ -366,32 +443,44 @@ fn to_duration(interval: PgInterval) -> Duration {
     }
 }
 
+fn from_duration(duration: Duration) -> PgInterval {
+    PgInterval::from_microseconds(duration.as_micros() as i64)
+}
+
 async fn poll_and_dispatch(
     job_runner: &Arc<JobRunner>,
     batch_size: i32,
-) -> Result<Duration, sqlx::Error> {
+) -> Result<Duration, Error> {
     log::info!("Polling for messages");
 
     let options = &job_runner.options;
-    let messages = sqlx::query_as::<_, PolledMessage>("SELECT * FROM mq_poll($1, $2)")
-        .bind(&options.channel_names)
-        .bind(batch_size)
-        .fetch_all(&options.pool)
-        .await?;
+    let conn = job_runner.options.pool.get().await?;
+    let runner = job_runner.clone();
+    let messages = conn
+        .interact(move |conn| {
+            let messages = diesel::sql_query("SELECT * FROM mq_poll($1, $2)")
+                .bind::<sql_types::Nullable<sql_types::Array<sql_types::Text>>, _>(
+                    &runner.options.channel_names,
+                )
+                .bind::<sql_types::Integer, _>(batch_size)
+                .load::<PolledMessage>(conn)?;
 
-    let ids_to_delete: Vec<_> = messages
-        .iter()
-        .filter(|msg| msg.is_committed == Some(false))
-        .filter_map(|msg| msg.id)
-        .collect();
+            let ids_to_delete: Vec<_> = messages
+                .iter()
+                .filter(|msg| msg.is_committed == Some(false))
+                .filter_map(|msg| msg.id)
+                .collect();
 
-    log::info!("Deleting {} messages", ids_to_delete.len());
-    if !ids_to_delete.is_empty() {
-        sqlx::query("SELECT mq_delete($1)")
-            .bind(ids_to_delete)
-            .execute(&options.pool)
-            .await?;
-    }
+            log::info!("Deleting {} messages", ids_to_delete.len());
+            if !ids_to_delete.is_empty() {
+                diesel::sql_query("SELECT mq_delete($1)")
+                    .bind::<sql_types::Array<sql_types::Uuid>, _>(ids_to_delete)
+                    .execute(conn)?;
+            }
+
+            Ok::<_, Error>(messages)
+        })
+        .await??;
 
     const MAX_WAIT: Duration = Duration::from_secs(60);
 
@@ -467,18 +556,35 @@ async fn main_loop(job_runner: Arc<JobRunner>, _listener_task: OwnedHandle) {
     }
 }
 
-async fn keep_job_alive(id: Uuid, pool: Pool<Postgres>, mut interval: Duration) {
+async fn keep_job_alive(id: Uuid, pool: Pool, mut interval: Duration) {
     loop {
         tokio::time::sleep(interval / 2).await;
         interval *= 2;
-        if let Err(e) = sqlx::query("SELECT mq_keep_alive(ARRAY[$1], $2)")
-            .bind(id)
-            .bind(interval)
-            .execute(&pool)
-            .await
-        {
-            log::error!("Failed to keep job {} alive: {}", id, e);
-            break;
+        let conn = match pool.get().await {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        let this_interval = interval.clone();
+        let result = conn
+            .interact(move |conn| {
+                diesel::sql_query("SELECT mq_keep_alive(ARRAY[$1], $2)")
+                    .bind::<sql_types::Uuid, _>(id)
+                    .bind::<sql_types::Interval, _>(from_duration(this_interval))
+                    .execute(conn)
+            })
+            .await;
+
+        match result {
+            Err(e) => {
+                log::error!("Failed to keep job {} alive: {}", id, e);
+                break;
+            }
+            Ok(Err(e)) => {
+                log::error!("Failed to keep job {} alive: {}", id, e);
+                break;
+            }
+            Ok(_) => {}
         }
     }
 }
