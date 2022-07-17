@@ -343,7 +343,7 @@ mod tests {
     async fn test_job_runner<F: Future + Send + 'static>(
         pool: &Pool,
         f: impl (Fn(CurrentJob) -> F) + Send + Sync + 'static,
-    ) -> (OwnedHandle, Arc<AtomicUsize>)
+    ) -> (JobRunnerHandle, Arc<AtomicUsize>)
     where
         F::Output: Send + 'static,
     {
@@ -395,7 +395,7 @@ mod tests {
         Ok(())
     }
 
-    async fn named_job_runner(pool: Pool, connection_string: String) -> OwnedHandle {
+    async fn named_job_runner(pool: Pool, connection_string: String) -> JobRunnerHandle {
         let mut registry = JobRegistry::new(&[example_job1, example_job2, example_job_with_ctx]);
         registry.set_context(42).set_context("Hello, world!");
         registry
