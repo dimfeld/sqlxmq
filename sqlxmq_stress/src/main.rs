@@ -4,11 +4,11 @@ use std::process::abort;
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
+use deadpool_diesel::postgres::Pool;
 use futures::channel::mpsc;
 use futures::StreamExt;
 use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
-use sqlx::{Pool, Postgres};
 use sqlxmq::{job, CurrentJob, JobRegistry};
 use tokio::task;
 
@@ -35,7 +35,10 @@ async fn example_job(
     let data: JobData = current_job.json()?.unwrap();
 
     // Mark the job as complete
-    current_job.complete().await?;
+    let conn = current_job.pool().get().await?;
+    conn.interact(move |conn| current_job.complete(conn))
+        .await
+        .map_err(sqlxmq::Error::from)??;
     let end_time = INSTANT_EPOCH.elapsed();
 
     CHANNEL.read().unwrap().unbounded_send(JobResult {
@@ -45,26 +48,28 @@ async fn example_job(
     Ok(())
 }
 
-async fn start_job(
-    pool: Pool<Postgres>,
-    seed: usize,
-) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
+async fn start_job(pool: Pool, seed: usize) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     let channel_name = if seed % 3 == 0 { "foo" } else { "bar" };
     let channel_args = format!("{}", seed / 32);
-    example_job
-        .builder()
-        // This is where we can override job configuration
-        .set_channel_name(channel_name)
-        .set_channel_args(&channel_args)
-        .set_json(&JobData {
-            start_time: INSTANT_EPOCH.elapsed(),
-        })?
-        .spawn(&pool)
-        .await?;
+    let conn = pool.get().await?;
+    conn.interact(move |conn| {
+        example_job
+            .builder()
+            // This is where we can override job configuration
+            .set_channel_name(channel_name)
+            .set_channel_args(&channel_args)
+            .set_json(&JobData {
+                start_time: INSTANT_EPOCH.elapsed(),
+            })?
+            .spawn(conn)?;
+        Ok::<_, Box<dyn Error + Send + Sync + 'static>>(())
+    })
+    .await
+    .map_err(sqlxmq::Error::from)??;
     Ok(())
 }
 
-async fn schedule_tasks(num_jobs: usize, interval: Duration, pool: Pool<Postgres>) {
+async fn schedule_tasks(num_jobs: usize, interval: Duration, pool: Pool) {
     let mut stream = tokio::time::interval(interval);
     for i in 0..num_jobs {
         let pool = pool.clone();
@@ -82,15 +87,20 @@ async fn schedule_tasks(num_jobs: usize, interval: Duration, pool: Pool<Postgres
 async fn main() -> Result<(), Box<dyn Error>> {
     let _ = dotenv::dotenv();
 
-    let pool = Pool::connect(&env::var("DATABASE_URL")?).await?;
+    let database_url = env::var("DATABASE_URL")?;
+    let manager =
+        deadpool_diesel::Manager::new(database_url.as_str(), deadpool_diesel::Runtime::Tokio1);
+    let pool = Pool::builder(manager).build()?;
 
+    let conn = pool.get().await?;
     // Make sure the queues are empty
-    sqlxmq::clear_all(&pool).await?;
+    conn.interact(sqlxmq::clear_all).await??;
+    drop(conn);
 
     let registry = JobRegistry::new(&[example_job]);
 
     let _runner = registry
-        .runner(&pool)
+        .runner(pool.clone(), database_url)
         .set_concurrency(50, 100)
         .run()
         .await?;

@@ -14,3 +14,9 @@ sqlx = "0.6.0"
 serde = "1.0.125"
 lazy_static = "1.4.0"
 futures = "0.3.13"
+diesel = { version = "2.0.0-rc.0", features = ["postgres", "chrono", "uuid"] }
+
+[dependencies.deadpool-diesel]
+git = "https://github.com/bikeshedder/deadpool"
+branch = "feature/diesel-2"
+features = ["postgres"]
