@@ -177,10 +177,10 @@ impl CurrentJob {
     pub fn complete_with_transaction<F, RETVAL, ERR>(
         &mut self,
         conn: &mut PgConnection,
-        mut f: F,
+        f: F,
     ) -> Result<RETVAL, ERR>
     where
-        F: (FnMut(&mut PgConnection) -> Result<RETVAL, ERR>) + Send + 'static,
+        F: (FnOnce(&mut PgConnection) -> Result<RETVAL, ERR>) + Send + 'static,
         ERR: From<diesel::result::Error> + Send + Sync + 'static,
         RETVAL: Send + 'static,
     {
@@ -206,10 +206,10 @@ impl CurrentJob {
     pub fn checkpoint_with_transaction<F, RETVAL, ERR>(
         &mut self,
         conn: &mut PgConnection,
-        mut f: F,
+        f: F,
     ) -> Result<RETVAL, ERR>
     where
-        for<'a> F: FnMut(&'a mut PgConnection) -> Result<(Checkpoint<'static>, RETVAL), ERR>,
+        for<'a> F: FnOnce(&'a mut PgConnection) -> Result<(Checkpoint<'static>, RETVAL), ERR>,
         ERR: From<Error> + From<diesel::result::Error>,
     {
         conn.transaction(|conn| {
@@ -516,7 +516,7 @@ async fn poll_and_dispatch(
 
     let wait_time = messages
         .iter()
-        .filter_map(|msg| msg.wait_time.clone())
+        .filter_map(|msg| msg.wait_time)
         .map(to_duration)
         .min()
         .unwrap_or(MAX_WAIT);
@@ -595,7 +595,7 @@ async fn keep_job_alive(id: Uuid, pool: Pool, mut interval: Duration) {
             Err(_) => continue,
         };
 
-        let this_interval = interval.clone();
+        let this_interval = interval;
         let result = conn
             .interact(move |conn| {
                 diesel::sql_query("SELECT mq_keep_alive(ARRAY[$1], $2)")
