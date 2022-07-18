@@ -90,7 +90,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let database_url = env::var("DATABASE_URL")?;
     let manager =
         deadpool_diesel::Manager::new(database_url.as_str(), deadpool_diesel::Runtime::Tokio1);
-    let pool = Pool::builder(manager).build()?;
+    let pool = Pool::builder(manager).max_size(32).build()?;
 
     let conn = pool.get().await?;
     // Make sure the queues are empty
